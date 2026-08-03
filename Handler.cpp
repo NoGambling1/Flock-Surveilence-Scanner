@@ -19,9 +19,9 @@ constexpr uint8_t DacDIN = 38; // Digital -> Audio Converter Data In
 constexpr uint8_t DacLCK = 47; // Digital -> Audio Converter Word Select
 
 // System Constants
-constexpr float ALERT_DISTANCE_METERS = 150.0f; // Distance threshold in meters
+constexpr float ALERT_DISTANCE_METERS = 150.0f; // Distance threshold in meters 
 constexpr unsigned long CAMERA_COOLDOWN_MS = 15000; // Cooldown between camera alerts
-constexpr int SAMPLE_RATE = 16000;
+constexpr int SAMPLE_RATE = 16000; // Stuff to pre-calculate sin waves, to save CPU cycles during audio playback
 constexpr int LUT_SIZE = 1024;
 int16_t sineLUT[LUT_SIZE];
 
@@ -29,7 +29,6 @@ int16_t sineLUT[LUT_SIZE];
 unsigned long lastCameraScan = 0;
 unsigned long lastCameraAlertTime = 0;
 
-// Volatile variables modified inside the Hardware Interrupt Service Routine (ISR)
 volatile double volume = 0.5; 
 volatile int8_t encoderPosition = 10;
 
@@ -76,15 +75,13 @@ QueueHandle_t audioQueue;
 void audioTask(void *pvParameters) {
     AudioCommand cmd;
     while (true) {
-        // This waits efficiently until an audio command is placed in the queue
         if (xQueueReceive(audioQueue, &cmd, portMAX_DELAY)) {
-            // Get safe local volume
             float safeVolume = encoderPosition / 20.0f; 
 
             if (cmd.isWav) {
                 void playWavFileTask(const char* filepath, float currentVolume);
             } else {
-                void playToneTask(cmd.freq, cmd.duration, safeVolume); // Rename original playTone to playToneTask
+                void playToneTask(cmd.freq, cmd.duration, safeVolume);
             }
         }
     }
@@ -94,7 +91,7 @@ void audioTask(void *pvParameters) {
 void handleButtonActions();
 void updateGPS();
 void scanForNearbyCameras(float myLat, float myLng);
-void playTone(int freq, int duration, double volume);
+void playToneTask(int freq, int duration, double volume);
 void playWavFile(const char* filepath);
 void triggerAlert(AlertType type, bool isNewTarget);
 void onDeviceDetected(bool isNewTarget, bool isFlock);
@@ -250,7 +247,7 @@ void playToneTask(int freq, int duration) {
     xQueueSend(audioQueue, &cmd, 0);
 }
 
-void playTone(int freq, int duration, double currentVolume) {
+void playToneTask(int freq, int duration, double currentVolume) {
     if (currentVolume > 1.0) currentVolume = 1.0;
     if (currentVolume < 0.0) currentVolume = 0.0;
 
@@ -277,14 +274,8 @@ void playTone(int freq, int duration, double currentVolume) {
     }
 }
 
-void playTone(int duration) { 
-    playTone(1000, duration); 
-}
 
-// ==========================================
-// BUTTON CONTROLLER
-// ==========================================
-ButtonEvent checkButtonEvent() {
+ButtonEvent checkButtonEvent() { // Check Rotary Encoder
     static unsigned long lastClickTime = 0;
     static int clickCount = 0;
     static bool lastButtonState = HIGH;
@@ -308,7 +299,7 @@ ButtonEvent checkButtonEvent() {
     return ButtonEvent::NONE;
 }
 
-void handleButtonActions() { 
+void handleButtonActions() {  // Handle what happens when the rotary encoder is pressed one time or two times
     ButtonEvent event = checkButtonEvent();
     if (event == ButtonEvent::SINGLE) {
         if (sysState == SystemState::ENABLED) {
@@ -334,9 +325,6 @@ void handleButtonActions() {
     }
 }
 
-// ==========================================
-// CENTRAL ALERT ROUTER
-// ==========================================
 void triggerAlert(AlertType type, bool isNewTarget) {
     if (sysState == SystemState::DISABLED) return;
 
@@ -355,14 +343,12 @@ void triggerAlert(AlertType type, bool isNewTarget) {
             if (isNewTarget) {
                 playWavFile(getAudioPath("Unknown - Wifi.wav"));
             } else {
-                // REMOVED 'volume' argument here!
-                playTone(1200, 80); 
+                playToneTask(1200, 80); 
             }
             break;
 
         case AnnounceModes::BEEP:
-            // REMOVED 'volume' argument here!
-            playTone(1000, 60); 
+            playToneTask(1000, 60); 
             break;
     }
 }
@@ -372,9 +358,6 @@ void onDeviceDetected(bool isNewTarget, bool isFlock) {
     triggerAlert(type, isNewTarget);
 }
 
-// ==========================================
-// GPS & PROXIMITY SCANNER
-// ==========================================
 void updateGPS() {
     while (Serial1.available() > 0) {
         char c = Serial1.read();
@@ -382,21 +365,18 @@ void updateGPS() {
     }
 }
 
-float calculateDistanceMeters(float lat1, float lon1, float lat2, float lon2) {
+float calculateDistanceMeters(float lat1, float lon1, float lat2, float lon2) { // Changed from Haversine for efficiency
     constexpr float EARTH_RADIUS = 6371000.0f;
     constexpr float DEG_TO_RAD = M_PI / 180.0f;
 
-    // Convert degrees to radians
     float lat1Rad = lat1 * DEG_TO_RAD;
     float lat2Rad = lat2 * DEG_TO_RAD;
     float lon1Rad = lon1 * DEG_TO_RAD;
     float lon2Rad = lon2 * DEG_TO_RAD;
 
-    // Apply Equirectangular approximation
     float x = (lon2Rad - lon1Rad) * cos((lat1Rad + lat2Rad) / 2.0f);
     float y = (lat2Rad - lat1Rad);
 
-    // Standard Pythagorean theorem to find the hypotenuse (distance)
     return EARTH_RADIUS * sqrt(x * x + y * y);
 }
 
@@ -410,13 +390,13 @@ void scanForNearbyCameras(float myLat, float myLng) {
     size_t totalRecords = file.size() / recordSize;
     if (totalRecords == 0) return;
 
-    int low = 0;
+    int low = 0; 
     int high = totalRecords - 1;
     int mid = 0;
     CameraPoint cam;
     bool foundChunk = false;
 
-    // 1. Binary search to find ANY camera within our latitude band (+/- 0.002)
+    // 1. Binary search to find only cameras near the current latitude band (±0.002 degrees)
     while (low <= high) {
         mid = low + (high - low) / 2;
         file.seek(mid * recordSize);
@@ -427,29 +407,24 @@ void scanForNearbyCameras(float myLat, float myLng) {
         } else if (cam.lat > myLat + 0.002f) {
             high = mid - 1; // Look lower
         } else {
-            foundChunk = true; // We landed inside the target latitude band!
+            foundChunk = true; 
             break; 
         }
     }
 
-    if (foundChunk) {
-        // 2. We are in the right band, but maybe in the middle of it. 
-        // Scan backwards to find where this latitude band actually starts.
+    if (foundChunk) { // Go to the first element of the chunk
         int searchStart = mid;
         while (searchStart > 0) {
             file.seek((searchStart - 1) * recordSize);
             file.read((uint8_t*)&cam, recordSize);
-            if (cam.lat < myLat - 0.002f) break; // We fell out the bottom of the band
+            if (cam.lat < myLat - 0.002f) break; 
             searchStart--;
         }
 
-        // 3. Now scan forward from the start of the band. 
-        // This checks only a tiny handful of local cameras instead of the whole file.
-        file.seek(searchStart * recordSize);
-        while (file.read((uint8_t*)&cam, recordSize) == recordSize) {
-            if (cam.lat > myLat + 0.002f) break; // Exited the top of the band, stop reading
 
-            // Now check longitude and actual distance
+        file.seek(searchStart * recordSize); // Check all cameras in the chunk if they're close to
+        while (file.read((uint8_t*)&cam, recordSize) == recordSize) {
+            if (cam.lat > myLat + 0.002f) break; 
             if (std::abs(cam.lng - myLng) < 0.002f) {
                 float distance = calculateDistanceMeters(myLat, myLng, cam.lat, cam.lng);
                 if (distance <= ALERT_DISTANCE_METERS) {
@@ -463,51 +438,41 @@ void scanForNearbyCameras(float myLat, float myLng) {
     file.close();
 }
 
-// ==========================================
-// SECONDARY ESP32 BOARD LISTENER (SERIAL2)
-// ==========================================
 void updateSecondaryBoardListener() {
     while (Serial2.available() > 0) {
         String msg = Serial2.readStringUntil('\n');
         msg.trim();
 
         if (msg.length() == 0) continue;
-
-        // If it's specifically flagged as a Flock hardware match by Board #2
-        if (msg == "FLOCK_ALERT") {
+        if (msg == "FLOCK_ALERT") { // If the Wifi/BLE detects a Flock Camera (Through Mac, SSID's, etc)
             triggerAlert(AlertType::FLOCK_CAMERA, true);
         } 
-        // If it's a generic Wi-Fi SSID name match or generic BLE match
-        else if (msg == "WIFI_ALERT" || msg == "BLE_ALERT") {
+        else if (msg == "WIFI_ALERT" || msg == "BLE_ALERT") { 
             triggerAlert(AlertType::WIFI_BLE_TARGET, true);
         } 
     }
 }
-void sendSpeedToSecondary() {
+void sendSpeedToSecondary() { // How long it scans WiFi and BLE before switching is based on speed 
     static int speedHistory[5] = {0, 0, 0, 0, 0};
     static uint8_t historyIndex = 0;
     static int lastSentSpeed = -1;
 
     int currentSpeed = 0;
 
-    // Read speed if GPS lock is valid
     if (gps.location.isValid() && gps.speed.isValid()) {
         currentSpeed = (int)gps.speed.mph();
     }
 
-    // Add current reading to moving average buffer
     speedHistory[historyIndex] = currentSpeed;
     historyIndex = (historyIndex + 1) % 5;
 
-    // Calculate 5-sample moving average
-    int sum = 0;
+    int sum = 0; // Uses 5 samples and finds the avg
     for (int i = 0; i < 5; ++i) {
         sum += speedHistory[i];
     }
     int smoothedSpeed = sum / 5;
 
-    // Only transmit over Serial2 when the smoothed speed changes
-    if (smoothedSpeed != lastSentSpeed) {
+    if (smoothedSpeed != lastSentSpeed) { // Only send data if the average changes
         lastSentSpeed = smoothedSpeed;
         Serial2.printf("SPEED:%d\n", smoothedSpeed);
         //Serial.printf("[COMMS] Sent to Board #2: SPEED:%d\n", smoothedSpeed);
