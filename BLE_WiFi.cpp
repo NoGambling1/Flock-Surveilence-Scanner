@@ -6,8 +6,8 @@
 #include <BLEAdvertisedDevice.h>
 #include <cstring> 
 
-constexpr uint8_t RX_PIN = 16; 
-constexpr uint8_t TX_PIN = 17; 
+constexpr uint8_t RX_PIN = 40; 
+constexpr uint8_t TX_PIN = 39; 
 bool wifiScanRunning = false;
 
 // Flock Safety / ALPR known MAC Address OUIs
