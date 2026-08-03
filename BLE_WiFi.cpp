@@ -4,14 +4,8 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include <cstring> // Required for strcasestr
+#include <cstring> 
 
-// ==========================================
-// PIN CONFIGURATION & COOLDOWNS
-// ==========================================
-// UART Pins to connect to Board #1
-// Wire Board #2 TX (17) to Board #1 RX (4)
-// Wire Board #2 RX (16) to Board #1 TX (5)
 constexpr uint8_t RX_PIN = 16; 
 constexpr uint8_t TX_PIN = 17; 
 bool wifiScanRunning = false;
@@ -35,21 +29,17 @@ constexpr unsigned long ALERT_COOLDOWN_MS = 10000;
 unsigned long lastBleAlert = 0;
 unsigned long lastWifiAlert = 0;
 
-// ==========================================
-// DYNAMIC SPEED HYSTERESIS ENGINE
-// ==========================================
-enum class SpeedTier { SLOW, CITY, HIGHWAY };
+
+enum class SpeedTier { SLOW, CITY, HIGHWAY }; // Dynamically changes scan rate based on speed
 
 SpeedTier currentTier = SpeedTier::CITY;
 int currentSpeedMph = 0;
 
-// Scan Durations (Wi-Fi is given more time than BLE in all tiers)
 int bleScanSec = 2;          // BLE takes seconds (integer)
 unsigned long wifiScanMs = 3000; // Wi-Fi takes milliseconds
 
 void updateSpeedTier() {
-    // Hysteresis: We require the speed to move well past the boundary before changing tiers
-    // This prevents "thrashing" if you are stuck at exactly 40 mph
+    // Uses Hysterisis so sitting at 40mph would not confuse the processor
     if (currentTier == SpeedTier::CITY) {
         if (currentSpeedMph >= 43) currentTier = SpeedTier::HIGHWAY;
         else if (currentSpeedMph <= 4) currentTier = SpeedTier::SLOW;
@@ -61,14 +51,13 @@ void updateSpeedTier() {
         if (currentSpeedMph >= 8) currentTier = SpeedTier::CITY;  // Move up to city only if actually driving
     }
 
-    // Assign scanning parameters based on the locked-in tier
     if (currentTier == SpeedTier::HIGHWAY) {
         bleScanSec = 1; 
         wifiScanMs = 1500;
     } else if (currentTier == SpeedTier::CITY) {
         bleScanSec = 2; 
         wifiScanMs = 3000;
-    } else { // SLOW / PARKED
+    } else { 
         bleScanSec = 3; 
         wifiScanMs = 5000;
     }
@@ -81,38 +70,30 @@ void readSpeedFromMainBoard() {
     while (Serial1.available() > 0) {
         char c = Serial1.read();
 
-        // If end of message is reached
         if (c == '\n') {
-            buffer[index] = '\0'; // Null-terminate the string
+            buffer[index] = '\0'; 
 
-            // Parse incoming "SPEED:45" using standard C string functions
+            // Parse the message to get the speed
             if (strncmp(buffer, "SPEED:", 6) == 0) {
                 currentSpeedMph = atoi(&buffer[6]);
             }
             
-            index = 0; // Reset index for the next incoming message
+            index = 0; 
         } 
-        // Ignore carriage returns, ensure we don't overflow the buffer
         else if (c != '\r' && index < sizeof(buffer) - 1) {
             buffer[index++] = c;
         }
     }
-}
 
-// ==========================================
-// BLE SCANNER LOGIC
-// ==========================================
 BLEScan* pBLEScan;
 
-class SurveillanceBleCallbacks : public BLEAdvertisedDeviceCallbacks {
+class SurveillanceBleCallbacks : public BLEAdvertisedDeviceCallbacks { // BLE Scanner logic
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
         bool matchFound = false;
 
-        // Get the raw constant character pointer
         const char* deviceName = advertisedDevice.getName().c_str();
 
-        // 1. Check Name (Case-insensitive substring search)
-        if (strlen(deviceName) > 0) {
+        if (strlen(deviceName) > 0) { // Check the name
             if (strcasestr(deviceName, "axon") != nullptr || 
                 strcasestr(deviceName, "flock") != nullptr || 
                 strcasestr(deviceName, "signal") != nullptr) {
@@ -120,8 +101,7 @@ class SurveillanceBleCallbacks : public BLEAdvertisedDeviceCallbacks {
             }
         }
 
-        // 2. Check Manufacturer ID 
-        if (!matchFound && advertisedDevice.haveManufacturerData()) {
+        if (!matchFound && advertisedDevice.haveManufacturerData()) { // Check the Manufacturer ID
             std::string rawData = advertisedDevice.getManufacturerData();
             if (rawData.length() >= 2) {
                 uint16_t companyId = ((uint8_t)rawData[1] << 8) | (uint8_t)rawData[0];
@@ -142,119 +122,83 @@ class SurveillanceBleCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
 };
 
-// ==========================================
-// SETUP
-// ==========================================
 void setup() {
-    Serial.begin(115200); // For USB Debugging
-    
-    // Hardware Serial1 to communicate with the Main ESP32
+    Serial.begin(115200); 
     Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
 
-    // Init BLE
-    BLEDevice::init("");
+    BLEDevice::init(""); // Initialize the scanner
     pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new SurveillanceBleCallbacks());
     pBLEScan->setActiveScan(true); 
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(99);
 
-    // Init Wi-Fi in station mode (we just need the radio on for scanning)
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_STA); // Initialize WiFI in Station Mode
     WiFi.disconnect();
     delay(100);
     
     Serial.println("[BOOT] Secondary Scanner Ready.");
 }
 
-// ==========================================
-// MAIN LOOP: TIME-SLICED STATE MACHINE
-// ========================================== 
 void loop() {
-    // 1. Read incoming speed from Main Board and adjust timing tiers
-    readSpeedFromMainBoard();
+    readSpeedFromMainBoard(); // Change scan rates if applicable
     updateSpeedTier();
 
-    // ----------------------------------------------------
-    // PHASE 1: BLUETOOTH SCAN
-    // ----------------------------------------------------
-    // pBLEScan->start() is blocking. It will safely hold here for exactly 'bleScanSec'
     pBLEScan->start(bleScanSec, false);
     pBLEScan->clearResults(); 
 
-    // Flush the serial buffer between phases so we don't miss speed updates
     readSpeedFromMainBoard(); 
 
-    // ----------------------------------------------------
-    // PHASE 2: WI-FI SCAN
-    // ----------------------------------------------------
     if (!wifiScanRunning) {
-        // Start a scan asynchronously (true, true)
-        WiFi.scanNetworks(true, true);
+        WiFi.scanNetworks(true, true); // Start an Async scan
         wifiScanRunning = true;
     }
 
-    // Check if the background scan is finished without blocking
-    int16_t networkCount = WiFi.scanComplete();
+    int16_t networkCount = WiFi.scanComplete(); // Check if the scan is finished without blocking
     
-    if (networkCount >= 0) { // Scan is done!
+    if (networkCount >= 0) { // When the scan is done
         for (int i = 0; i < networkCount; ++i) {
-            
-            // Safely extract the SSID string and convert to c_str 
-            // We store it in a local String object first to prevent the pointer from dangling
             String ssidStr = WiFi.SSID(i); 
             const char* ssid = ssidStr.c_str();
             
-            // Get the raw BSSID (MAC Address) byte array
-            uint8_t* bssid = WiFi.BSSID(i); 
-
-            // Shift the first 3 bytes into a single 32-bit integer for fast comparison
+            uint8_t* bssid = WiFi.BSSID(i); // Get the MAC Address
             uint32_t targetOUI = (bssid[0] << 16) | (bssid[1] << 8) | bssid[2];
-
             bool isFlockHardware = false;
             
-            // 1. Check against the Flock OUI list
-            for (int j = 0; j < FLOCK_OUI_COUNT; j++) {
+            for (int j = 0; j < FLOCK_OUI_COUNT; j++) { // Check the MAC against the known list
                 if (targetOUI == FLOCK_OUIS[j]) {
                     isFlockHardware = true;
                     break;
                 }
             }
 
-            // 2. Trigger the appropriate alert
             unsigned long currentMS = millis();
             
             if (isFlockHardware) {
                 if (currentMS - lastWifiAlert >= ALERT_COOLDOWN_MS) {
                     lastWifiAlert = currentMS;
-                    // Send a specific FLOCK_ALERT so Board #1 knows exactly what it is
                     Serial1.println("FLOCK_ALERT"); 
-                    // Print the first 3 bytes of the MAC to the debug console
                     Serial.printf("[WIFI TARGET] Flock OUI Found: %02x:%02x:%02x:...\n", bssid[0], bssid[1], bssid[2]);
                 }
             } 
-            // 3. Fast Case-Insensitive search on the SSID
-            else if (strcasestr(ssid, "axon") != nullptr || 
+            else if (strcasestr(ssid, "axon") != nullptr || // If its not flock but contains suspicious words, send an alert
                      strcasestr(ssid, "flock") != nullptr || 
                      strcasestr(ssid, "camera") != nullptr ||
                      strcasestr(ssid, "surveillance") != nullptr) {
                 
                 if (currentMS - lastWifiAlert >= ALERT_COOLDOWN_MS) {
                     lastWifiAlert = currentMS;
-                    // Send a generic WIFI_ALERT for unknown/suspicious networks
-                    Serial1.println("WIFI_ALERT"); 
+                    Serial1.println("WIFI_ALERT"); // Generic WiFi alert
                     Serial.printf("[WIFI TARGET] Suspicious SSID: %s\n", ssid);
                 }
             }
         }
         
-        // Clear memory buffer and reset the flag so the next scan can trigger
-        WiFi.scanDelete();
+        WiFi.scanDelete(); // Clear memory buffer
         wifiScanRunning = false;
         
     } 
-    else if (networkCount == WIFI_SCAN_FAILED) {
-        // Failsafe in case the internal Wi-Fi radio crashes
+    else if (networkCount == WIFI_SCAN_FAILED) { // If the WiFi scanner crashes
         wifiScanRunning = false; 
     }
 }
